@@ -325,9 +325,17 @@ impl KnownServer {
             None => true,
             Some(known) if known == passport => false,
             Some(known) => {
+                // Carimbos só desempatam o mesmo passaporte. Entre passaportes distintos emitidos no
+                // mesmo segundo (ex.: membro e logo depois moderador) vence o de permissões
+                // estritamente maiores, independente da ordem de chegada (todos os nós convergem)
+                let same_second = passport.body.issued_at == known.body.issued_at;
+                let same_serial = passport.body.serial == known.body.serial;
+                let wider = known.body.permissions.iter().all(|p| passport.body.permissions.contains(p))
+                    && passport.body.permissions.len() > known.body.permissions.len();
                 state.verify_passport(known, now).is_err()
                     || passport.body.issued_at > known.body.issued_at
-                    || (passport.body.issued_at == known.body.issued_at && passport.stamps.len() > known.stamps.len())
+                    || (same_second && !same_serial && wider)
+                    || (same_second && same_serial && passport.stamps.len() > known.stamps.len())
             }
         };
         if replace {
@@ -823,8 +831,14 @@ impl ServerRegistry {
     pub fn answer_access_request(&self, server_id: &str, issuer: &UserIdentity, requester: &str, now: UtcSecs) -> Option<ServerMessage> {
         let server = self.servers.get(server_id).filter(|s| s.has_chain())?;
         let state = server.effective_state(now);
-        if state.closed || state.is_banned(requester, now) || server.is_allowed(requester, now) {
+        if state.closed || state.is_banned(requester, now) {
             return None;
+        }
+        // Já conhecemos um passaporte válido dele: o pedido repetido indica que a oferta anterior
+        // não chegou (pedido feito antes de ter a cadeia, ou perda no gossip). Reenvia o mesmo.
+        if server.is_allowed(requester, now) {
+            let passport = server.passport_of(requester)?.clone();
+            return Some(ServerMessage::PassportOffer { server_id: server_id.to_string(), target: requester.to_string(), passport });
         }
         let can_issue = server.is_owner() || server.my_passport().is_some_and(|p| p.allows(PassportPermission::IssueMember));
         if !can_issue {
@@ -1158,6 +1172,39 @@ mod tests {
         // Os membros conhecem o passaporte quando ele chega no KeyPackage de entrada (ou no Welcome)
         assert!(member.get_mut(&id).unwrap().learn_passport(&passport, T0));
         assert!(member.get(&id).unwrap().is_allowed(&pk(&guest), T0 + 1));
+    }
+
+    #[test]
+    fn test_same_second_passports_converge_to_wider_regardless_of_order() {
+        let (owner, mut member, id) = owner_and_member();
+        let guest = UserIdentity::generate();
+        let issuer = UserIdentity::generate();
+        let basic = owner.issue_passport(&id, &issuer, &pk(&guest), PassportPermission::member(), None, T0).unwrap();
+        let moderator = owner.issue_passport(&id, &issuer, &pk(&guest), PassportPermission::default_moderator(), None, T0).unwrap();
+        let mut stamped = basic.clone();
+        stamped.stamps.push(TimestampAttestation::Rfc3161 { tsa: "x".into(), token_der: vec![] });
+        stamped.stamps.push(TimestampAttestation::Rfc3161 { tsa: "x".into(), token_der: vec![] });
+
+        // Membro chega atrasado (com carimbos) depois do moderador emitido no mesmo segundo
+        let server = member.get_mut(&id).unwrap();
+        assert!(server.learn_passport(&basic, T0));
+        assert!(server.learn_passport(&moderator, T0), "moderador amplia o membro do mesmo segundo");
+        assert!(!server.learn_passport(&stamped, T0), "membro atrasado não rebaixa o moderador");
+        assert!(server.passport_of(&pk(&guest)).unwrap().is_moderator());
+    }
+
+    #[test]
+    fn test_access_request_resends_known_passport() {
+        let (mut owner, _member, id) = owner_and_member();
+        let guest = UserIdentity::generate();
+        let issuer = UserIdentity::generate();
+        let Some(ServerMessage::PassportOffer { passport: first, .. }) = owner.answer_access_request(&id, &issuer, &pk(&guest), T0) else { panic!() };
+        owner.get_mut(&id).unwrap().learn_passport(&first, T0);
+        // A oferta se perdeu (pedido antes de ter a cadeia): o pedido repetido recebe o mesmo passaporte
+        let Some(ServerMessage::PassportOffer { passport: again, .. }) = owner.answer_access_request(&id, &issuer, &pk(&guest), T0 + 5) else {
+            panic!("pedido repetido deve reenviar a oferta")
+        };
+        assert_eq!(again.body.serial, first.body.serial);
     }
 
     #[test]
